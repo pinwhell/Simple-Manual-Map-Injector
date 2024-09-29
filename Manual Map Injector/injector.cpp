@@ -12,6 +12,11 @@
 #define CURRENT_ARCH IMAGE_FILE_MACHINE_I386
 #endif
 
+std::optional<uint64_t> GetLdrpHandleTlsDataRVA()
+{
+	return 0x54590;
+}
+
 std::optional<HMODULE> GetModuleBaseAddress(DWORD processID, const char* moduleName) {
 	HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processID);
 	if (hSnapshot == INVALID_HANDLE_VALUE) {
@@ -34,7 +39,7 @@ std::optional<HMODULE> GetModuleBaseAddress(DWORD processID, const char* moduleN
 	return std::nullopt;  // Return nullopt if the module was not found
 }
 
-std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, std::optional<MSPDBX::PDBSymRVAResolver> ntSymbolSolver, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
+std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
 	auto procNtdll = GetModuleBaseAddress(GetProcessId(hProc), "ntdll.dll");
 	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
 	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
@@ -63,21 +68,43 @@ std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize,
 		return std::nullopt;
 	}
 
+	std::unique_ptr<BYTE[]> emptyBuffStrg = std::make_unique<BYTE[]>(1024 * 1024 * 20);
+	BYTE* emptyBuffer = emptyBuffStrg.get();
+	if (emptyBuffer == nullptr) {
+		ILog("Unable to allocate memory\n");
+		return std::nullopt;
+	}
+	memset(emptyBuffer, 0, 1024 * 1024 * 20);
+
 	DWORD oldp = 0;
 	VirtualProtectEx(hProc, pTargetBase, pOldOptHeader->SizeOfImage, PAGE_EXECUTE_READWRITE, &oldp);
-
+	
 	MANUAL_MAPPING_DATA data{ 0 };
-	data.pDummyLdr = (LDR_DATA_TABLE_ENTRY*)malloc(sizeof(LDR_DATA_TABLE_ENTRY)); memset(data.pDummyLdr, 0, sizeof(LDR_DATA_TABLE_ENTRY));
+	data.pDummyLdr = (LDR_DATA_TABLE_ENTRY*)VirtualAllocEx(hProc, nullptr, sizeof(LDR_DATA_TABLE_ENTRY) * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); 
+	WriteProcessMemory(hProc, data.pDummyLdr, emptyBuffer, sizeof(LDR_DATA_TABLE_ENTRY) * 4, nullptr);
 	data.pLdrpHandleTlsData = [&]() -> f_LdrpHandleTlsData {
-		if (!procNtdll || !ntSymbolSolver)
+		if (!procNtdll)
 			return nullptr;
 
-		auto ldrpHandleTlsDataRVA = (*ntSymbolSolver).Resolve("LdrpHandleTlsData");
+		auto rva = GetLdrpHandleTlsDataRVA();
 
-		if (!ldrpHandleTlsDataRVA)
+		if (!rva)
+		{
+			ILog("LdrpHandleTlsData Not found\n");
 			return nullptr;
+		}
 
-		return (f_LdrpHandleTlsData)((uint64_t)(*procNtdll) + (*ldrpHandleTlsDataRVA));
+		auto r = (f_LdrpHandleTlsData)((uint64_t)(*procNtdll) + *rva);
+
+		// Hash Like Integrity Check
+		if (*(uint16_t*)r != 0x8948 ||
+			*(uint16_t*)((char*)r + 5) != 0x8948)
+		{
+			ILog("LdrpHandleTlsData Integrity Check Failed\n");
+			return nullptr;
+		}
+
+		return r;
 		}();
 	data.pLoadLibraryA = LoadLibraryA;
 	data.pGetProcAddress = GetProcAddress;
@@ -192,14 +219,6 @@ std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize,
 
 		Sleep(10);
 	}
-
-	std::unique_ptr<BYTE[]> emptyBuffStrg = std::make_unique<BYTE[]>(1024 * 1024 * 20);
-	BYTE* emptyBuffer = emptyBuffStrg.get();
-	if (emptyBuffer == nullptr) {
-		ILog("Unable to allocate memory\n");
-		return std::nullopt;
-	}
-	memset(emptyBuffer, 0, 1024 * 1024 * 20);
 
 	//CLEAR PE HEAD
 	if (ClearHeader) {
@@ -344,7 +363,7 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 
 	/*Todo
 	* Unlink from TLS list pData->pDummyLdr
-	* Finally free/release pData->pDummyLdr
+	* Finally release pData->pDummyLdr
 	*/
 
 	if (pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size) {

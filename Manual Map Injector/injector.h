@@ -61,5 +61,5 @@ struct MANUAL_MAPPING_DATA
 
 
 //Note: Exception support only x64 with build params /EHa or /EHc
-std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, std::optional<MSPDBX::PDBSymRVAResolver> ntSymbolSolver = std::nullopt, bool ClearHeader = true, bool ClearNonNeededSections = true, bool AdjustProtections = true, bool SEHExceptionSupport = true, DWORD fdwReason = DLL_PROCESS_ATTACH, LPVOID lpReserved = 0);
+std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeader = true, bool ClearNonNeededSections = true, bool AdjustProtections = true, bool SEHExceptionSupport = true, DWORD fdwReason = DLL_PROCESS_ATTACH, LPVOID lpReserved = 0);
 void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData);
