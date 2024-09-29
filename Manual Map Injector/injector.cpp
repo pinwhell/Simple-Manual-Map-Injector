@@ -34,7 +34,7 @@ std::optional<HMODULE> GetModuleBaseAddress(DWORD processID, const char* moduleN
 	return std::nullopt;  // Return nullopt if the module was not found
 }
 
-std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, std::optional<MSPDBX::PDBSymRVAResolver> symbolSolver, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
+std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, std::optional<MSPDBX::PDBSymRVAResolver> ntSymbolSolver, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
 	auto procNtdll = GetModuleBaseAddress(GetProcessId(hProc), "ntdll.dll");
 	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
 	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
@@ -69,10 +69,10 @@ std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize,
 	MANUAL_MAPPING_DATA data{ 0 };
 	data.pDummyLdr = (LDR_DATA_TABLE_ENTRY*)malloc(sizeof(LDR_DATA_TABLE_ENTRY)); memset(data.pDummyLdr, 0, sizeof(LDR_DATA_TABLE_ENTRY));
 	data.pLdrpHandleTlsData = [&]() -> f_LdrpHandleTlsData {
-		if (!procNtdll || !symbolSolver)
+		if (!procNtdll || !ntSymbolSolver)
 			return nullptr;
 
-		auto ldrpHandleTlsDataRVA = (*symbolSolver).Resolve("LdrpHandleTlsData");
+		auto ldrpHandleTlsDataRVA = (*ntSymbolSolver).Resolve("LdrpHandleTlsData");
 
 		if (!ldrpHandleTlsDataRVA)
 			return nullptr;
@@ -193,7 +193,8 @@ std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize,
 		Sleep(10);
 	}
 
-	BYTE* emptyBuffer = (BYTE*)malloc(1024 * 1024 * 20);
+	std::unique_ptr<BYTE[]> emptyBuffStrg = std::make_unique<BYTE[]>(1024 * 1024 * 20);
+	BYTE* emptyBuffer = emptyBuffStrg.get();
 	if (emptyBuffer == nullptr) {
 		ILog("Unable to allocate memory\n");
 		return std::nullopt;
