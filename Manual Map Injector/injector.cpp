@@ -1,5 +1,7 @@
 #include "injector.h"
 
+#define SHELLCODE_BASE 0x000001caae9a0000
+
 #if defined(DISABLE_OUTPUT)
 #define ILog(data, ...)
 #else
@@ -34,7 +36,7 @@ std::optional<HMODULE> GetModuleBaseAddress(DWORD processID, const char* moduleN
 	return std::nullopt;  // Return nullopt if the module was not found
 }
 
-std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, std::optional<MSPDBX::PDBSymRVAResolver> ntSymbolSolver, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
+std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, void* requestBase, std::optional<MSPDBX::PDBSymRVAResolver*> ntSymbolSolver, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
 	auto procNtdll = GetModuleBaseAddress(GetProcessId(hProc), "ntdll.dll");
 	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
 	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
@@ -57,22 +59,31 @@ std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize,
 
 	ILog("File ok\n");
 
-	pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProc, nullptr, pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+	pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProc, requestBase, pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 	if (!pTargetBase) {
 		ILog("Target process memory allocation failed (ex) 0x%X\n", GetLastError());
 		return std::nullopt;
 	}
 
+	std::unique_ptr<BYTE[]> emptyBuffStrg = std::make_unique<BYTE[]>(1024 * 1024 * 20);
+	BYTE* emptyBuffer = emptyBuffStrg.get();
+	if (emptyBuffer == nullptr) {
+		ILog("Unable to allocate memory\n");
+		return std::nullopt;
+	}
+	memset(emptyBuffer, 0, 1024 * 1024 * 20);
+
 	DWORD oldp = 0;
 	VirtualProtectEx(hProc, pTargetBase, pOldOptHeader->SizeOfImage, PAGE_EXECUTE_READWRITE, &oldp);
 
 	MANUAL_MAPPING_DATA data{ 0 };
-	data.pDummyLdr = (LDR_DATA_TABLE_ENTRY*)malloc(sizeof(LDR_DATA_TABLE_ENTRY)); memset(data.pDummyLdr, 0, sizeof(LDR_DATA_TABLE_ENTRY));
+	data.pDummyLdr = (LDR_DATA_TABLE_ENTRY*)VirtualAllocEx(hProc, nullptr, sizeof(LDR_DATA_TABLE_ENTRY) * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	WriteProcessMemory(hProc, data.pDummyLdr, emptyBuffer, sizeof(LDR_DATA_TABLE_ENTRY) * 4, nullptr);
 	data.pLdrpHandleTlsData = [&]() -> f_LdrpHandleTlsData {
 		if (!procNtdll || !ntSymbolSolver)
 			return nullptr;
 
-		auto ldrpHandleTlsDataRVA = (*ntSymbolSolver).Resolve("LdrpHandleTlsData");
+		auto ldrpHandleTlsDataRVA = (*ntSymbolSolver)->Resolve("LdrpHandleTlsData");
 
 		if (!ldrpHandleTlsDataRVA)
 			return nullptr;
@@ -126,7 +137,7 @@ std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize,
 	}
 
 	//Shell code
-	void* pShellcode = VirtualAllocEx(hProc, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	void* pShellcode = VirtualAllocEx(hProc, (void*)SHELLCODE_BASE, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	if (!pShellcode) {
 		ILog("Memory shellcode allocation failed (ex) 0x%X\n", GetLastError());
 		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
@@ -154,15 +165,22 @@ std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize,
 	system("pause");
 #endif
 
-	HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellcode), MappingDataAlloc, 0, nullptr);
-	if (!hThread) {
-		ILog("Thread creation failed 0x%X\n", GetLastError());
-		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-		VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
-		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
-		return std::nullopt;
+	if (GetProcessId(hProc) != GetCurrentProcessId())
+	{
+		// Remotely Execute it
+		HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellcode), MappingDataAlloc, 0, nullptr);
+		if (!hThread) {
+			ILog("Thread creation failed 0x%X\n", GetLastError());
+			VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+			VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
+			VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+			return std::nullopt;
+		}
+		CloseHandle(hThread);
+	} else {
+		// Same Process
+		Shellcode((MANUAL_MAPPING_DATA*)MappingDataAlloc);
 	}
-	CloseHandle(hThread);
 
 	ILog("Thread created at: %p, waiting for return...\n", pShellcode);
 
@@ -192,14 +210,6 @@ std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize,
 
 		Sleep(10);
 	}
-
-	std::unique_ptr<BYTE[]> emptyBuffStrg = std::make_unique<BYTE[]>(1024 * 1024 * 20);
-	BYTE* emptyBuffer = emptyBuffStrg.get();
-	if (emptyBuffer == nullptr) {
-		ILog("Unable to allocate memory\n");
-		return std::nullopt;
-	}
-	memset(emptyBuffer, 0, 1024 * 1024 * 20);
 
 	//CLEAR PE HEAD
 	if (ClearHeader) {
