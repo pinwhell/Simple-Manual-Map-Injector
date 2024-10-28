@@ -4,7 +4,18 @@ project(TheCruZMMap)
 
 find_package(MSPDBX REQUIRED)
 
-add_compile_options(/MT$<$<CONFIG:Debug>:d> /GR- /INCREMENTAL:NO)
+option(USE_STATIC_LINKING "Use static linking for the runtime" ON)
+
+if (USE_STATIC_LINKING)
+    if (MSVC)
+        # MSVC specific static linking flag
+        add_compile_options(/MT$<$<CONFIG:Debug>:d> /GR- /INCREMENTAL:NO)
+    else()
+        # GCC/Clang specific static linking flag
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static-libgcc -static-libstdc++")
+    endif()
+endif()
+
 add_link_options(/INCREMENTAL:NO /OPT:REF /OPT:ICF)
 
 set(IS_DEBUG_BUILD FALSE)
